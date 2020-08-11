@@ -122,6 +122,10 @@ struct CLFR_Value {
     // std::vector<uint64_t> timeStamps;
 };
 
+struct OriginalPacket {
+    pcap_pkthdr* hdr;
+    u_char* pkt;
+};
 
 // Helpers.
 void setKey(char *keyBuf, const struct ip *ipHeader, const struct udphdr *udpOrtcpHeader);

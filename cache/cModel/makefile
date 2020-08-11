@@ -1,7 +1,7 @@
 all: starflowModel
 
 starflowModel: starflowModel.cpp
-	g++ starflowModel.cpp -o starflowModel -lpcap -std=c++11
+	g++ starflowModel.cpp -g -o starflowModel -lpcap -lpthread -std=c++11
 
 clean: 
 	rm starflowModel

@@ -4,19 +4,20 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
-#include <math.h>
 #include <stdlib.h>
 
-#include <algorithm>    // std::max
 #include <iostream>
 #include <fstream>
 #include <cstring>
-#include <sstream> // for ostringstream
 #include <vector>
-#include <deque>
-#include <unordered_map>
 #include <list>
+
+#include <queue>
+#include <zconf.h>
+#include <atomic>
+#include <tuple>
 
 using namespace std;
 
@@ -33,14 +34,14 @@ using namespace std;
 #define TRACETYPE 1 // Trace type: 0 = ethernet, 1 = ip4v (i.e., caida)
 #define UPDATE_CT 10000 // Print stats every UPDATE_CT packets.
 
-uint64_t maxLastAccessTs = 0;
-uint64_t sumLastAccessTs = 0;
-uint64_t gtOneSecondInCache = 0;
-uint64_t gtFiveSecondInCache = 0;
+std::atomic<uint64_t> maxLastAccessTs;
+std::atomic<uint64_t> sumLastAccessTs;
+std::atomic<uint64_t> gtOneSecondInCache;
+std::atomic<uint64_t> gtFiveSecondInCache;
 
 char *outputFile = "mCLFRs.bin";
 ofstream o;
-bool dump = false;
+bool dump = true;
 // args.
 char *inputFile;
 uint64_t trainingTime, lruChainLen, partition1Len, partition1Width, partition2Len, partition2Width;
@@ -53,28 +54,42 @@ uint64_t htLen;
 // the mclfr feature vectors are limited to partition1Width entries. 
 MCLFR **LRUChains;
 
-MCLFR oldCLFR;
+//MCLFR oldCLFR;
 
 // the long packet feature vectors.
 // index --> (fixed len feature vector)
-PacketFeatures **longVectors;
+//PacketFeatures **longVectors;
 
-uint32_t stackTop = 0;
+std::atomic<uint32_t> stackTop;
 uint32_t *longVectorStack;
 
 
-uint64_t lastLongUse[1024] = {0};
-uint64_t accessCounts[1024] = {0};
+//uint64_t lastLongUse[1024] = {0};
+//uint64_t accessCounts[1024] = {0};
 
 
 // logging and output. 
-uint64_t globalPktCt, globalMfCt;
+std::atomic<uint64_t> globalPktCt, globalMfCt, globalMissCt;
 uint64_t globalFinMfCt;
-uint64_t allocFailEvicts, lruEvicts, oversizeEvicts, shortRollovers, longRollovers;
+std::atomic<uint64_t> allocFailEvicts, lruEvicts, oversizeEvicts, shortRollovers, longRollovers;
 
-uint64_t startTs, curTs;
+uint64_t startTs;
+std::atomic<uint64_t> maxTs;
 
 std::vector<Export_MCLFR> mCLFR_out;
+
+queue<OriginalPacket *> packetQueue;
+
+#define NUM_THREADS 2
+pthread_t threads[NUM_THREADS];
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t slotMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
+
+std::atomic<bool> done = ATOMIC_VAR_INIT(false);
+clock_t start_time;
+
+[[noreturn]] void *waitFunction(void *arg);
 
 void dumpCtFile();
 
@@ -85,6 +100,10 @@ void readMClfrs(char *inputFile);
 void printStats();
 
 void checkCorrectness();
+
+void packetHandler(u_char *userData, const struct pcap_pkthdr *pkthdr, const u_char *packet);
+
+void packetRoutine(OriginalPacket *pkt);
 
 // PFE cache functions.
 // set up the tables. 
@@ -97,11 +116,11 @@ void initTables() {
         memset(LRUChains[i], 0, sizeof(MCLFR) * lruChainLen);
     }
     // Set up the long packet feature vectors.
-    longVectors = new PacketFeatures *[partition2Len];
-    for (int i = 0; i < partition2Len; i++) {
-        longVectors[i] = new PacketFeatures[partition2Width];
-        memset(longVectors[i], 0, sizeof(PacketFeatures) * partition2Width);
-    }
+//    longVectors = new PacketFeatures *[partition2Len];
+//    for (int i = 0; i < partition2Len; i++) {
+//        longVectors[i] = new PacketFeatures[partition2Width];
+//        memset(longVectors[i], 0, sizeof(PacketFeatures) * partition2Width);
+//    }
     // Set up the long vector stack.
     // bottom entry of stack should never be touched.
     longVectorStack = new uint32_t[partition2Len];
@@ -115,119 +134,122 @@ void initTables() {
 #define SLOT_MATCH 0
 #define SLOT_FREE 1
 #define SLOT_EVICT 2
+#define PACKET_EVICT 3
 
-int slotType; // match, free, evict flag.
-uint64_t getSlotId();
+tuple<uint64_t, short int> getSlotId(u_int64_t, PacketRecord *);
 
 // processing logic.
-void initMfr();
+void initMfr(MCLFR *, PacketRecord *);
 
-void evictMfr();
+void evictMfr(MCLFR *chainItem, MCLFR *evictedMFR);
 
-void shortAppend();
+void shortAppend(MCLFR *, PacketRecord *, MCLFR *);
 
-void longAppend();
+void longAppend(MCLFR *, PacketRecord *, MCLFR *);
 
-void exportMfr();
+void exportMfr(MCLFR *);
 
 // helpers.
-void allocLongPointer();
+void allocLongPointer(MCLFR *);
 
-void appendRecord();
+void appendRecord(MCLFR *, PacketRecord *);
 
 // main.
-void handlePacket();
+void handlePacket(PacketRecord *);
 
 // cleanup.
 void finalFlush();
 
-PacketRecord pr; // current packet record.
-MCLFR evictedMFR; // mCLFR that is going to be evicted.
+//MCLFR evictedMFR; // mCLFR that is going to be evicted.
 
-uint64_t hashVal;
-uint64_t slotId;
 
-// main packet processing function. 
-void handlePacket() {
+// main packet processing function.
+void handlePacket(PacketRecord *pr) {
+    if ((trainingTime > 0) && ((pr->features.ts) > trainingTime * 1000)) {
+//        cout << "exiting training: " << pr->features.ts << " : " << trainingTime << endl;
+        done = true;
+        return;
+    }
     globalPktCt++;
 
+    uint64_t hashVal;
+    uint64_t slotId;
+    short int slotType;
 
     // Compute hash.
-    hashVal = simpleHash(1, pr.key, KEYLEN, htLen);
+    hashVal = simpleHash(1, pr->key, KEYLEN, htLen);
     // Get the layer 1 slot -- either a match, free slot, or oldest entry.
     // get slot id.
-    slotId = getSlotId();
-    // cout << "hash value: " << hashVal << " slot id: " << slotId << endl;
-    // if (hashVal == 29 && slotId == 0){
-    //   cout << "29 PKT ARRIVAL pktCt: " << LRUChains[hashVal][slotId].pktCt << endl;
-    // }
+
+    pthread_mutex_lock(&slotMutex);
+    auto tup = getSlotId(hashVal, pr);
+    slotId = get<0>(tup);
+    slotType = get<1>(tup);
+
+    MCLFR evictedMFR;
     // Main processing pipeline.
 
     switch (slotType) {
 
         // FREE SLOT pipeline -- just set new record.
         case SLOT_FREE:
-            // cout << "initializing ( " << hashVal << ", " << slotId << " ) pktCt: " << LRUChains[hashVal][slotId].pktCt << endl;
-            initMfr();
+//             cout << "initializing ( " << hashVal << ", " << slotId << " ) pktCt: " << LRUChains[hashVal][slotId].pktCt << endl;
+            initMfr(&LRUChains[hashVal][slotId], pr);
             break;
             // EVICT SLOT pipeline -- read prior record, free prior long pointer, set record.
         case SLOT_EVICT:
-            // cout << "evicting ( " << hashVal << ", " << slotId << " ) pktCt: " << LRUChains[hashVal][slotId].pktCt << endl;
-            evictMfr();
-            initMfr();
-            exportMfr();
+//            cout << "evicting ( " << hashVal << ", " << slotId << " ) pktCt: " << LRUChains[hashVal][slotId].pktCt
+//                 << endl;
+            evictMfr(&LRUChains[hashVal][slotId], &evictedMFR);
+            initMfr(&LRUChains[hashVal][slotId], pr);
+            exportMfr(&evictedMFR);
             break;
             // MATCH SLOT pipeline -- append to short, alloc+append long, or append to long.
         case SLOT_MATCH:
-            // cout << "incrementing ( " << hashVal << ", " << slotId << " ) pktCt: " << LRUChains[hashVal][slotId].pktCt << endl;
+//             cout << "incrementing ( " << hashVal << ", " << slotId << " ) pktCt: " << LRUChains[hashVal][slotId].pktCt << endl;
 
             // get the long pointer if eligible.
-            allocLongPointer();
+            allocLongPointer(&LRUChains[hashVal][slotId]);
 
             if (LRUChains[hashVal][slotId].longVectorIdx == 0) {
-                shortAppend();
+                shortAppend(&LRUChains[hashVal][slotId], pr, &evictedMFR);
             } else {
-                longAppend();
+                longAppend(&LRUChains[hashVal][slotId], pr, &evictedMFR);
             }
             break;
+        case PACKET_EVICT:
+//            cout << "Throwing this packet ( " << hashVal << ", " << slotId << " ) pktCt: "
+//                 << LRUChains[hashVal][slotId].pktCt << endl;
+            initMfr(&evictedMFR, pr);
+            evictedMFR.pktCt += 1;
+            exportMfr(&evictedMFR);
+            break;
         default:
-            cout << "invalid switch case" << endl;
+            cout << "invalid switch case" << slotType << endl;
     }
 
     // Stats stuff.
-    if (globalPktCt % UPDATE_CT == 0) {
-        printStats();
-    }
+//    if (globalPktCt % UPDATE_CT == 0) {
+//        printStats();
+//    }
 
-    if ((trainingTime > 0) && ((curTs) > trainingTime * 1000)) {
-        cout << "exiting training." << endl;
-        printStats();
-
-        if (dump) {
-            finalFlush();
-            dumpCtFile();
-            // dumpMClfrs();
-        }
-        exit(0);
-    }
-    // exit(1);
-
+    pthread_mutex_unlock(&slotMutex);
 }
 
-uint64_t getSlotId() {
+tuple<uint64_t, short int> getSlotId(uint64_t hashVal, PacketRecord *pr) {
     // Scan list for match, inUse entry, or oldest entry.
     bool hasMatch = false;
     uint64_t matchPos;
     bool hasFree = false;
+    bool hasOld = false;
     uint64_t freePos;
     uint64_t oldestPos;
-    uint64_t oldestTs = curTs + 1;
+    uint64_t oldestTs = pr->features.ts + 1;
 
-    for (int cPos = 0; cPos < lruChainLen; cPos++) {
-        // cout << "\tcPos: " << cPos << endl;
+    for (uint64_t cPos = 0; cPos < lruChainLen; cPos++) {
         // printMfrInfo(LRUChains[hashVal][cPos]);
         // Check match.
-        if (memcmp(LRUChains[hashVal][cPos].key, pr.key, KEYLEN) == 0) {
+        if (memcmp(LRUChains[hashVal][cPos].key, pr->key, KEYLEN) == 0) {
             hasMatch = true;
             matchPos = cPos;
             break;
@@ -235,9 +257,10 @@ uint64_t getSlotId() {
         // Check for older entry.
         // cout << "\ttses: " << LRUChains[hashVal][cPos].lastAccessTs << " vs " << oldestTs << endl;
         if (LRUChains[hashVal][cPos].lastAccessTs < oldestTs) {
+            hasOld = true;
             oldestTs = LRUChains[hashVal][cPos].lastAccessTs;
             oldestPos = cPos;
-            // cout << "\toldestPos1: " << oldestPos << endl;
+            // cout << "\toldestPos: " << oldestPos << endl;
         }
         // Check for null entry.
         if (!hasFree && (!LRUChains[hashVal][cPos].inUse)) {
@@ -246,34 +269,27 @@ uint64_t getSlotId() {
         }
     }
     if (hasMatch) {
-        slotType = SLOT_MATCH;
-        // cout << "\tmatchPos: " << matchPos << endl;
-        return matchPos;
+        return {matchPos, SLOT_MATCH};
     } else if (hasFree) {
-        slotType = SLOT_FREE;
-        // cout << "\tfreePos: " << freePos << endl;
-        return freePos;
+        return {freePos, SLOT_FREE};
+    } else if (hasOld) {
+        return {oldestPos, SLOT_EVICT};
     } else {
-        slotType = SLOT_EVICT;
-        // cout << "\toldestPos: " << oldestPos << endl;
-        return oldestPos;
+        return {-1, PACKET_EVICT};
     }
-
-    //
 }
 
 
 // Final evict.
 void finalFlush() {
+    MCLFR evictedMFR;
     uint64_t finalFlushCt = 0;
     for (int i = 0; i < htLen; i++) {
         for (int j = 0; j < lruChainLen; j++) {
             if (LRUChains[i][j].inUse) {
                 finalFlushCt++;
-                hashVal = i;
-                slotId = j;
-                evictMfr();
-                exportMfr();
+                evictMfr(&LRUChains[i][j], &evictedMFR);
+                exportMfr(&evictedMFR);
             }
         }
     }
@@ -305,10 +321,6 @@ void dumpMClfrs() {
 void dumpCtFile() {
     cout << "\twrote " << globalMfCt << " mCLFRs to " << outputFile << endl;
     o.close();
-    ofstream osz(string(outputFile) + string(".len"), ios::binary);
-    cout << "\twrote value " << globalMfCt << " to " << string(outputFile) + string(".len") << endl;
-    osz.write((char *) &globalMfCt, sizeof(globalMfCt));
-    osz.close();
 
     // readMClfrs(outputFile);
 }
@@ -336,14 +348,14 @@ void dumpCtFile() {
 //     tmpClfr.pktCt = (uint32_t)tmpMClfr.pktCt;
 //     tmpClfr.keyStr = std::string(tmpClfr.key, KEYLEN);
 
-//     // emplace tmp clfr into map. 
+//     // emplace tmp clfr into map.
 //     CLFRTable.emplace(tmpClfr.keyStr, tmpClfr);
 
 //     // evict here based on TCP flag.
 
 //     // read features into tmp vector.
 //     in.read((char*)tmpMClfr.packetVector, sizeof(PacketFeatures)*tmpMClfr.pktCt);
-//     // iterate through features and insert. 
+//     // iterate through features and insert.
 //     for (int j = 0; j<tmpClfr.pktCt; j++){
 //       CLFRTable[tmpClfr.keyStr].byteCounts.push_back(tmpMClfr.packetVector[j].byteCt);
 //       CLFRTable[tmpClfr.keyStr].timeStamps.push_back(tmpMClfr.packetVector[j].ts);
@@ -351,29 +363,31 @@ void dumpCtFile() {
 //     }
 //   }
 //   cout << "done reading microflows" << endl;
-//   // Done. 
+//   // Done.
 //   in.close();
 // }
 
 void printStats() {
-    cout << "---------------------- trace time (usec): " << curTs << " ----------------------" << endl;
+    cout << "FINAL STATS:" << endl;
+    cout << "---------------------- trace time (usec): " << maxTs << " ----------------------" << endl;
     cout << "\t # packets processed: " << globalPktCt << endl;
+    cout << "\t # packets missed: " << globalMissCt << endl;
     cout << "\t # GPVs generated: " << globalMfCt << endl;
     cout << "\t GPV to packet ratio: " << float(globalMfCt) / float(globalPktCt) << endl;
     cout << "\t # evicts: " << lruEvicts << endl;
     cout << "\t # rollovers in short partition: " << shortRollovers << endl;
     cout << "\t # rollovers in long partition: " << longRollovers << endl;
     // cout << "\t mfs with fin flags: " << globalFinMfCt << endl;
-    cout << "\t avg time in cache (usec): " << (sumLastAccessTs / globalMfCt) << endl;
-    cout << "\t max time in cache: " << maxLastAccessTs << endl;
-    cout << "\t # flows that spent more than 1 second in cache: " << gtOneSecondInCache << endl;
-    cout << "\t # flows that spent more than 5 seconds in cache: " << gtFiveSecondInCache << endl;
+//    cout << "\t avg time in cache (usec): " << float(sumLastAccessTs) / float(globalMfCt) << endl;
+//    cout << "\t max time in cache: " << maxLastAccessTs << endl;
+//    cout << "\t # flows that spent more than 1 second in cache: " << gtOneSecondInCache << endl;
+//    cout << "\t # flows that spent more than 5 seconds in cache: " << gtFiveSecondInCache << endl;
+    cout << "\t # Time taken: " << (double) ((double) clock() - start_time) / CLOCKS_PER_SEC << endl;
     cout << "------------------------------------------------------------------" << endl;
 }
 
-void packetHandler(u_char *userData, const struct pcap_pkthdr *pkthdr, const u_char *packet);
-
 int main(int argc, char *argv[]) {
+    start_time = clock();
     if (argc != 8) {
         cout
                 << "incorrect number of arguments. Need 7. filename, training time, lru chain length, partition 1 length, partition 1 width, partition 2 length, partition 2 width."
@@ -400,45 +414,118 @@ int main(int argc, char *argv[]) {
         o.open(outputFile, ios::binary);
     }
 
+    for (unsigned long &thread : threads) {
+        pthread_create(&thread, nullptr, waitFunction, nullptr);
+//        cout << "creating thread, " << thread << endl;
+    }
+
     // Process packets.
     pcap_t *descr;
     char errbuf[PCAP_ERRBUF_SIZE];
     // open capture file for offline processing
     descr = pcap_open_offline(inputFile, errbuf);
-    if (descr == NULL) {
+    if (descr == nullptr) {
         cerr << "pcap_open_live() failed: " << errbuf << endl;
         return 1;
     }
     // start packet processing loop, just like live capture
-    if (pcap_loop(descr, 0, packetHandler, NULL) < 0) {
+    int pcap_loop_ret = pcap_loop(descr, 0, packetHandler, (u_char *) descr);
+    if (pcap_loop_ret == PCAP_ERROR_BREAK) {
+        cout << "Pcap Loop terminated" << endl;
+    } else if (pcap_loop_ret < 0) {
         cerr << "pcap_loop() failed: " << pcap_geterr(descr);
         return 1;
     }
-    cout << "done processing." << endl;
-    cout << "FINAL STATS:" << endl;
-    printStats();
+
+    done = true;
+    pthread_mutex_lock(&mutex);
+    pthread_cond_signal(&condition);
+    pthread_mutex_unlock(&mutex);
+    for (unsigned long &thread : threads) {
+        pthread_join(thread, nullptr);
+    }
+
     if (dump) {
         finalFlush();
         dumpCtFile();
         // dumpMClfrs();
     }
-    exit(0);
 
-    return 0;
+    printStats();
+
+    exit(0);
 }
 
-// The packet handler that implements the flow record generator. 
+// The packet handler that implements the flow record generator.
 void packetHandler(u_char *userData, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
+    auto *org = (OriginalPacket *) malloc(sizeof(OriginalPacket));
+
+    org->hdr = (pcap_pkthdr *) malloc(sizeof(pcap_pkthdr));
+    memcpy(org->hdr, pkthdr, sizeof(pcap_pkthdr));
+
+    org->pkt = (u_char *) malloc(sizeof(u_char *) * pkthdr->caplen);
+    memcpy(org->pkt, packet, pkthdr->caplen);
+
+    if (startTs == 0) {
+        packetRoutine(org);
+    } else {
+        if (done) {
+            pcap_breakloop((pcap_t *) userData);
+        }
+        pthread_mutex_lock(&mutex);
+        packetQueue.push(org);
+        pthread_cond_signal(&condition);
+        pthread_mutex_unlock(&mutex);
+    }
+}
+
+[[noreturn]] void *waitFunction(void *arg) {
+    while (true) {
+        pthread_mutex_lock(&mutex);
+        if (packetQueue.front() == nullptr) {
+            if (done) {
+                pthread_cond_signal(&condition);
+                pthread_mutex_unlock(&mutex);
+                pthread_exit(nullptr);
+            }
+            pthread_cond_wait(&condition, &mutex);
+            if (packetQueue.front() == nullptr) {
+                pthread_mutex_unlock(&mutex);
+                continue;
+            }
+        }
+        OriginalPacket *val = packetQueue.front();
+        packetQueue.pop();
+        pthread_mutex_unlock(&mutex);
+        if (val != nullptr) {
+            packetRoutine(val);
+        }
+    }
+}
+
+void packetRoutine(OriginalPacket *pkt) {
+    const struct pcap_pkthdr *pkthdr = pkt->hdr;
+    u_char *packet = pkt->pkt;
     const struct ether_header *ethernetHeader;
     const struct ip *ipHeader;
     const struct tcphdr *tcpHeader;
     const struct udphdr *udpHeader;
 
+//    free(pkt);
+    uint64_t curTs;
 
     // Set global timestamp relative to start of pcap.
-    if (startTs == 0) startTs = getMicrosecondTs(pkthdr->ts.tv_sec, pkthdr->ts.tv_usec);
+    if (startTs == 0) {
+        startTs = getMicrosecondTs(pkthdr->ts.tv_sec, pkthdr->ts.tv_usec);
+    }
     curTs = getMicrosecondTs(pkthdr->ts.tv_sec, pkthdr->ts.tv_usec) - startTs;
 
+//    read-modify-write operation
+    uint64_t oldValue = maxTs.load();
+    while (curTs > oldValue) {
+        if (maxTs.compare_exchange_weak(oldValue, curTs))
+            break; // Succeeded updating.
+    }
 
     // Get IP header.
     if (TRACETYPE == 0) {
@@ -448,9 +535,9 @@ void packetHandler(u_char *userData, const struct pcap_pkthdr *pkthdr, const u_c
         }
     } else if (TRACETYPE == 1) {
         ipHeader = (struct ip *) (packet);
-
     }
 
+    PacketRecord pr{};
     // Parse packet into microflow format.
     if (ipHeader->ip_p == 6) {
         tcpHeader = (tcphdr *) ((u_char *) ipHeader + sizeof(*ipHeader));
@@ -461,7 +548,7 @@ void packetHandler(u_char *userData, const struct pcap_pkthdr *pkthdr, const u_c
         pr.features.ts = curTs;
         pr.features.queueSize = 1;
 
-        handlePacket();
+        handlePacket(&pr);
     } else if (ipHeader->ip_p == 17) {
         udpHeader = (udphdr *) ((u_char *) ipHeader + sizeof(*ipHeader));
         // Set raw key.
@@ -471,11 +558,13 @@ void packetHandler(u_char *userData, const struct pcap_pkthdr *pkthdr, const u_c
         pr.features.ts = curTs;
         pr.features.queueSize = 1;
 
-        handlePacket();
+        handlePacket(&pr);
+    } else {
+//        cout << "The extra packet: " << pkt->hdr.ts.tv_usec << ": curTS: " << curTs
+//             << " startTs: " << startTs << endl;
+        globalMissCt++;
     }
-
 }
-
 
 /*=================================
 =            New stuff            =
@@ -483,122 +572,112 @@ void packetHandler(u_char *userData, const struct pcap_pkthdr *pkthdr, const u_c
 
 
 
-void initMfr() {
-    LRUChains[hashVal][slotId].firstAccessTs = curTs;
-    // set key. 
-    memcpy(LRUChains[hashVal][slotId].key, pr.key, KEYLEN);
+void initMfr(MCLFR *chainItem, PacketRecord *pr) {
+    chainItem->firstAccessTs = pr->features.ts;
+    // set key.
+    memcpy(chainItem->key, pr->key, KEYLEN);
     // set flow features.
-    LRUChains[hashVal][slotId].pktCt = 0;
+    chainItem->pktCt = 0;
 
     // append packet features.
-    appendRecord();
+    appendRecord(chainItem, pr);
 
     // set processing state.
-    LRUChains[hashVal][slotId].inUse = true;
-    LRUChains[hashVal][slotId].allocAttempt = false; // never tried alloc.
-    LRUChains[hashVal][slotId].longVectorIdx = 0;
-
-
+    chainItem->inUse = true;
+    chainItem->allocAttempt = false; // never tried alloc.
+    chainItem->longVectorIdx = 0;
 }
 
 
-void evictMfr() {
+void evictMfr(MCLFR *chainItem, MCLFR *evictedMFR) {
     lruEvicts++;
-    // cout << "\tevict called on ( " << hashVal << ", " << slotId << " )" << endl;
-    // cout << "evicting MFR" << endl;
-    memcpy(&evictedMFR, &(LRUChains[hashVal][slotId]), sizeof(evictedMFR));
-    evictedMFR.pktCt += 1; // Correct packet count, when evict, it represent the last packet ID.
+    memcpy(evictedMFR, chainItem, sizeof(MCLFR));
+    evictedMFR->pktCt += 1; // Correct packet count, when evict, it represent the last packet ID.
     // If it was previously allocated a partition 2, free it.
-    if (LRUChains[hashVal][slotId].longVectorIdx != 0) {
+    if (chainItem->longVectorIdx != 0) {
         // cout << "freeing long vector ( " << hashVal << ", " << slotId << " )" << endl;
         stackTop++;
-        longVectorStack[stackTop] = LRUChains[hashVal][slotId].longVectorIdx;
-        LRUChains[hashVal][slotId].longVectorIdx = 0;
+        longVectorStack[stackTop] = chainItem->longVectorIdx;
+        chainItem->longVectorIdx = 0;
     }
-    LRUChains[hashVal][slotId].inUse = false;
+    chainItem->inUse = false;
 }
 
-void allocLongPointer() {
-    if (LRUChains[hashVal][slotId].allocAttempt == false
-        && (LRUChains[hashVal][slotId].pktCt + 1) == partition1Width) {
-        LRUChains[hashVal][slotId].allocAttempt = true;
+void allocLongPointer(MCLFR *chainItem) {
+    if (!chainItem->allocAttempt && (chainItem->pktCt + 1) == partition1Width) {
+        chainItem->allocAttempt = true;
         if (stackTop > 0) {
             // cout << "claiming long vector ( " << hashVal << ", " << slotId << " )" << endl;
             // cout << "\tgot long vector index: " << myLongVectorIdx << " from stack pos: " << stackTop << endl;
-            LRUChains[hashVal][slotId].longVectorIdx = longVectorStack[stackTop];
+            chainItem->longVectorIdx = longVectorStack[stackTop];
             stackTop--;
         } else {
-            LRUChains[hashVal][slotId].longVectorIdx = 0;
+            chainItem->longVectorIdx = 0;
         }
     }
 }
 
-void appendRecord() {
-    LRUChains[hashVal][slotId].packetVector[LRUChains[hashVal][slotId].pktCt] = pr.features;
-    LRUChains[hashVal][slotId].th_flags = LRUChains[hashVal][slotId].th_flags | pr.th_flags;
-    LRUChains[hashVal][slotId].lastAccessTs = curTs;
+void appendRecord(MCLFR *chainItem, PacketRecord *pr) {
+    chainItem->packetVector[chainItem->pktCt] = pr->features;
+    chainItem->th_flags = chainItem->th_flags | pr->th_flags;
+    chainItem->lastAccessTs = pr->features.ts;
 }
 
-void shortAppend() {
+void shortAppend(MCLFR *chainItem, PacketRecord *pr, MCLFR *evictedMFR) {
     // Increment packet id.
-    LRUChains[hashVal][slotId].pktCt += 1;
+    chainItem->pktCt += 1;
     // If pktCt % partition1Width == 0, do a short rollover: export current record, overwrite it.
-    if (LRUChains[hashVal][slotId].pktCt % partition1Width == 0) {
-        memcpy(&evictedMFR, &(LRUChains[hashVal][slotId]), sizeof(evictedMFR));
-        LRUChains[hashVal][slotId].pktCt = 0;
-        exportMfr();
+    if (chainItem->pktCt % partition1Width == 0) {
+        memcpy(evictedMFR, chainItem, sizeof(MCLFR));
+        chainItem->pktCt = 0;
+        exportMfr(evictedMFR);
         shortRollovers++;
     }
     // append the record for this packet.
-    appendRecord();
+    appendRecord(chainItem, pr);
 }
 
-void longAppend() {
+void longAppend(MCLFR *chainItem, PacketRecord *pr, MCLFR *evictedMFR) {
     // Increment packet id.
-    LRUChains[hashVal][slotId].pktCt += 1;
+    chainItem->pktCt += 1;
     // If pktCt % (partition1Width+partition2Width) == 0, do a long rollover: export current record, overwrite it.
-    if (LRUChains[hashVal][slotId].pktCt % (partition1Width + partition2Width) == 0) {
-        memcpy(&evictedMFR, &(LRUChains[hashVal][slotId]), sizeof(evictedMFR));
-        LRUChains[hashVal][slotId].pktCt = 0;
-        exportMfr();
+    if (chainItem->pktCt % (partition1Width + partition2Width) == 0) {
+        memcpy(evictedMFR, chainItem, sizeof(MCLFR));
+        chainItem->pktCt = 0;
+        exportMfr(evictedMFR);
         longRollovers++;
     }
     // append the record for this packet.
-    appendRecord();
+    appendRecord(chainItem, pr);
 }
 
 // convert to export format, increment counters, write to file, etc.
-void exportMfr() {
+void exportMfr(MCLFR *evictedMFR) {
     if (dump) {
-        Export_MCLFR outMclfr;
+        Export_MCLFR outMclfr{};
         // Copy to packed key.
-        memcpy((char *) &outMclfr.packedKey.addrs, evictedMFR.key, 8);
-        memcpy((char *) &outMclfr.packedKey.portsproto, evictedMFR.key + 8, 4);
-        memcpy((char *) &outMclfr.packedKey.portsproto, evictedMFR.key + 12, 1);
+        memcpy((char *) &outMclfr.packedKey.addrs, evictedMFR->key, 8);
+        memcpy((char *) &outMclfr.packedKey.portsproto, evictedMFR->key + 8, 4);
+        memcpy((char *) &outMclfr.packedKey.portsproto, evictedMFR->key + 12, 1);
 
         // Copy flow features.
-        outMclfr.flowFeatures.pktCt = (uint32_t) evictedMFR.pktCt;
-        outMclfr.flowFeatures.th_flags = evictedMFR.th_flags;
+        outMclfr.flowFeatures.pktCt = (uint32_t) evictedMFR->pktCt;
+        outMclfr.flowFeatures.th_flags = evictedMFR->th_flags;
 
         if (((outMclfr.flowFeatures.th_flags & TH_FIN) == TH_FIN) ||
             ((outMclfr.flowFeatures.th_flags & TH_RST) == TH_RST)) {
             globalFinMfCt++;
         }
         // copy packet features.
-        memcpy(outMclfr.packetVector, evictedMFR.packetVector, sizeof(PacketFeatures) * outMclfr.flowFeatures.pktCt);
+        memcpy(outMclfr.packetVector, evictedMFR->packetVector, sizeof(PacketFeatures) * outMclfr.flowFeatures.pktCt);
 
         // don't store vector.
         // mCLFR_out.push_back(outMclfr);
 
         // print timestamps..
-        // std::cout << "cur ts: " << curTs << " evicted pkt ct: " << outMclfr.flowFeatures.pktCt <<  " evicted last ts: " << outMclfr.packetVector[outMclfr.flowFeatures.pktCt-1].ts << std::endl;
-        if (outMclfr.packetVector[outMclfr.flowFeatures.pktCt - 1].ts > curTs) {
-            std::cout << " time traveller" << std::endl;
-            exit(1);
-        }
 
-        Export_MCLFR t1;
-        Export_MCLFR_hdr t2;
+//        Export_MCLFR t1;
+//        Export_MCLFR_hdr t2;
         // cout << "whole struct: " << sizeof(t1) << " hdr: " << sizeof(t2) << " array: " << sizeof(t1.packetVector) << " individual pkt features: " << sizeof(PacketFeatures) * MCLFR_MAXLEN << endl;
         // exit(1);
         // Write to output file.
@@ -609,17 +688,6 @@ void exportMfr() {
             o.write((char *) outMclfr.packetVector, sizeof(PacketFeatures) * outMclfr.flowFeatures.pktCt);
         }
     }
-    uint64_t inCacheTime = curTs - evictedMFR.firstAccessTs;
-    maxLastAccessTs = std::max(maxLastAccessTs, inCacheTime);
-    sumLastAccessTs += inCacheTime;
-    if (inCacheTime > 1000000) {
-        gtOneSecondInCache++;
-    }
-    if (inCacheTime > 5000000) {
-        gtFiveSecondInCache++;
-    }
-
-
     globalMfCt++;
 }
 
