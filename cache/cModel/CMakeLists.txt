@@ -8,6 +8,8 @@ SET(CMAKE_CXX_FLAGS -pthread)
 
 set(SOURCE_FILES starflowModel.cpp)
 
+include(FindPCAP.cmake)
+
 # add the executable
 add_executable(starflowModel ${SOURCE_FILES})
 target_link_libraries(starflowModel ${PCAP_LIBRARY})

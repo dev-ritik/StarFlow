@@ -31,8 +31,8 @@ using namespace std;
 // partition 2 length, partition 2 width
 
 // Static options.
-#define TRACETYPE 1 // Trace type: 0 = ethernet, 1 = ip4v (i.e., caida)
-#define UPDATE_CT 10000 // Print stats every UPDATE_CT packets.
+#define TRACE_TYPE 0 // Trace type: 0 = ethernet, 1 = ip4v (i.e., caida)
+#define UPDATE_CT 1000 // Print stats every UPDATE_CT packets.
 
 std::atomic<uint64_t> maxLastAccessTs;
 std::atomic<uint64_t> sumLastAccessTs;
@@ -43,7 +43,7 @@ char *outputFile = "mCLFRs.bin";
 ofstream o;
 bool dump = true;
 // args.
-char *inputFile;
+char *source;
 uint64_t trainingTime, lruChainLen, partition1Len, partition1Width, partition2Len, partition2Width;
 
 // table variables.
@@ -80,7 +80,7 @@ std::vector<Export_MCLFR> mCLFR_out;
 
 queue<OriginalPacket *> packetQueue;
 
-#define NUM_THREADS 2
+#define NUM_THREADS 5
 pthread_t threads[NUM_THREADS];
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t slotMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -95,7 +95,7 @@ void dumpCtFile();
 
 void dumpMClfrs();
 
-void readMClfrs(char *inputFile);
+void readMClfrs(char *source);
 
 void printStats();
 
@@ -165,11 +165,11 @@ void finalFlush();
 
 // main packet processing function.
 void handlePacket(PacketRecord *pr) {
-    if ((trainingTime > 0) && ((pr->features.ts) > trainingTime * 1000)) {
-//        cout << "exiting training: " << pr->features.ts << " : " << trainingTime << endl;
-        done = true;
-        return;
-    }
+//    if ((trainingTime > 0) && ((pr->features.ts) > trainingTime * 1000)) {
+////        cout << "exiting training: " << pr->features.ts << " : " << trainingTime << endl;
+//        done = true;
+//        return;
+//    }
     globalPktCt++;
 
     uint64_t hashVal;
@@ -229,9 +229,9 @@ void handlePacket(PacketRecord *pr) {
     }
 
     // Stats stuff.
-//    if (globalPktCt % UPDATE_CT == 0) {
-//        printStats();
-//    }
+    if (globalPktCt % UPDATE_CT == 0) {
+        printStats();
+    }
 
     pthread_mutex_unlock(&slotMutex);
 }
@@ -326,16 +326,16 @@ void dumpCtFile() {
 }
 
 // // Read mCLFRs and reassembly into vector format.
-// void readMClfrs(char * inputFile){
-//   cout << "reading mCLFRs from: " << inputFile << endl;
+// void readMClfrs(char * source){
+//   cout << "reading mCLFRs from: " << source << endl;
 //   uint64_t ct = 0;
 //   Export_MCLFR inMclfr;
-//   ifstream insz(string(inputFile)+string(".len"), ios::binary);
+//   ifstream insz(string(source)+string(".len"), ios::binary);
 //   insz.read((char*)&ct, sizeof(ct));
 //   insz.close();
 //   cout << "reading " << ct << " mCLFRs" << endl;
 
-//   ifstream in(inputFile, ios::binary);
+//   ifstream in(source, ios::binary);
 //   std::unordered_map<std::string, CLFR> CLFRTable;
 //   std::unordered_map<std::string, CLFR> CLFRTable_fin;
 //   CLFR tmpClfr;
@@ -394,8 +394,8 @@ int main(int argc, char *argv[]) {
                 << endl;
         exit(0);
     }
-    inputFile = argv[1];
-    cout << "reading from file: " << inputFile << endl;
+    source = argv[1];
+    cout << "reading from file: " << source << endl;
     trainingTime = atoi(argv[2]);
     lruChainLen = atoi(argv[3]);
     partition1Len = atoi(argv[4]);
@@ -423,7 +423,8 @@ int main(int argc, char *argv[]) {
     pcap_t *descr;
     char errbuf[PCAP_ERRBUF_SIZE];
     // open capture file for offline processing
-    descr = pcap_open_offline(inputFile, errbuf);
+//    descr = pcap_open_offline(source, errbuf);
+    descr = pcap_open_live(source, 65535, 0, -1, errbuf);
     if (descr == nullptr) {
         cerr << "pcap_open_live() failed: " << errbuf << endl;
         return 1;
@@ -482,7 +483,7 @@ void packetHandler(u_char *userData, const struct pcap_pkthdr *pkthdr, const u_c
 [[noreturn]] void *waitFunction(void *arg) {
     while (true) {
         pthread_mutex_lock(&mutex);
-        if (packetQueue.front() == nullptr) {
+        if (packetQueue.empty()) {
             if (done) {
                 pthread_cond_signal(&condition);
                 pthread_mutex_unlock(&mutex);
@@ -528,12 +529,59 @@ void packetRoutine(OriginalPacket *pkt) {
     }
 
     // Get IP header.
-    if (TRACETYPE == 0) {
+    if (TRACE_TYPE == 0) {
         ethernetHeader = (struct ether_header *) packet;
         if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_IP) {
             ipHeader = (struct ip *) (packet + sizeof(struct ether_header));
+        } else if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_ARP) {
+//            cout << "ETHERTYPE_ARP" << endl;
+            globalMissCt++;
+            return;
+        } else if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_PUP) {
+//            cout << "ETHERTYPE_PUP" << endl;
+            globalMissCt++;
+            return;
+        } else if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_SPRITE) {
+//            cout << "ETHERTYPE_SPRITE" << endl;
+            globalMissCt++;
+            return;
+        } else if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_ARP) {
+//            cout << "APR Packet" << endl;
+            globalMissCt++;
+            return;
+        } else if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_REVARP) {
+//            cout << "ETHERTYPE_REVARP" << endl;
+            globalMissCt++;
+            return;
+        } else if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_AT) {
+//            cout << "ETHERTYPE_AT" << endl;
+            globalMissCt++;
+            return;
+        } else if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_AARP) {
+//            cout << "ETHERTYPE_AARP" << endl;
+            globalMissCt++;
+            return;
+        } else if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_VLAN) {
+//            cout << "ETHERTYPE_VLAN" << endl;
+            globalMissCt++;
+            return;
+        } else if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_IPX) {
+//            cout << "ETHERTYPE_IPX" << endl;
+            globalMissCt++;
+            return;
+        } else if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_IPV6) {
+//            cout << "ETHERTYPE_IPV6" << endl;
+            globalMissCt++;
+            return;
+        } else if (ntohs(ethernetHeader->ether_type) == ETHERTYPE_LOOPBACK) {
+//            cout << "ETHERTYPE_LOOPBACK" << endl;
+            globalMissCt++;
+            return;
+        } else {
+            globalMissCt++;
+            return;
         }
-    } else if (TRACETYPE == 1) {
+    } else if (TRACE_TYPE == 1) {
         ipHeader = (struct ip *) (packet);
     }
 
@@ -560,8 +608,6 @@ void packetRoutine(OriginalPacket *pkt) {
 
         handlePacket(&pr);
     } else {
-//        cout << "The extra packet: " << pkt->hdr.ts.tv_usec << ": curTS: " << curTs
-//             << " startTs: " << startTs << endl;
         globalMissCt++;
     }
 }
