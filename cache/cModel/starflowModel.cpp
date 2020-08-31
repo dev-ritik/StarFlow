@@ -490,7 +490,7 @@ void packetHandler(u_char *userData, const struct pcap_pkthdr *pkthdr, const u_c
                 pthread_exit(nullptr);
             }
             pthread_cond_wait(&condition, &mutex);
-            if (packetQueue.front() == nullptr) {
+            if (packetQueue.empty()) {
                 pthread_mutex_unlock(&mutex);
                 continue;
             }
