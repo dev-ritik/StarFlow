@@ -429,6 +429,23 @@ int main(int argc, char *argv[]) {
         cerr << "pcap_open_live() failed: " << errbuf << endl;
         return 1;
     }
+    /* to hold compiled program */
+    struct bpf_program fp{};
+
+    // Compile the filter expression
+    if(pcap_compile(descr, &fp, "ip", 1, 0) == -1)
+    {
+        printf("\npcap_compile() failed\n");
+        return -1;
+    }
+
+    // Set the filter compiled above
+    if(pcap_setfilter(descr, &fp) == -1)
+    {
+        printf("\npcap_setfilter() failed\n");
+        exit(1);
+    }
+
     // start packet processing loop, just like live capture
     int pcap_loop_ret = pcap_loop(descr, 0, packetHandler, (u_char *) descr);
     if (pcap_loop_ret == PCAP_ERROR_BREAK) {
